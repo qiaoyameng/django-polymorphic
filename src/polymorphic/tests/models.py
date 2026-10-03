@@ -1158,3 +1158,41 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+# Models for testing polymorphic_prefetch()
+class MediaTag(models.Model):
+    name = models.CharField(max_length=30)
+
+
+class MediaAuthor(models.Model):
+    name = models.CharField(max_length=30)
+
+
+class MediaLabel(models.Model):
+    name = models.CharField(max_length=30)
+
+
+class MediaBase(PolymorphicModel):
+    title = models.CharField(max_length=30)
+    tags = models.ManyToManyField(MediaTag, related_name="media")
+
+
+class MediaArticle(MediaBase):
+    authors = models.ManyToManyField(MediaAuthor, related_name="articles")
+
+
+class MediaFeaturedArticle(MediaArticle):
+    featured = models.BooleanField(default=False)
+
+
+class MediaVideo(MediaBase):
+    pass
+
+
+class MediaTrack(models.Model):
+    name = models.CharField(max_length=30)
+    video = models.ForeignKey(MediaVideo, related_name="tracks", on_delete=models.CASCADE)
+    label = models.ForeignKey(
+        MediaLabel, related_name="tracks", null=True, on_delete=models.CASCADE
+    )

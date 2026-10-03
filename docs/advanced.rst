@@ -274,6 +274,44 @@ About Queryset Methods
     it is only possible to pass fields on the base model into these methods.
 
 
+Prefetching relations of subclasses
+-----------------------------------
+
+Django's :meth:`~django.db.models.query.QuerySet.prefetch_related` can only prefetch relations
+that exist on the base model of a queryset. To prefetch relations that only exist on some
+subclasses, use
+:meth:`~polymorphic.managers.PolymorphicQuerySet.polymorphic_prefetch` with a mapping of
+model class to prefetch lookups:
+
+.. code-block:: python
+
+    from django.db.models import Prefetch
+
+    MediaBase.objects.polymorphic_prefetch({
+        MediaArticle: ["authors"],
+        MediaVideo: [
+            Prefetch("tracks", queryset=Track.objects.order_by("name"), to_attr="sorted_tracks"),
+        ],
+    })
+
+After the real instances have been retrieved, the lookups of each plan entry are applied to
+just the objects of that entry's model (and its subclasses). Lookups may be plain relation
+paths (including nested paths like ``"tracks__label"``) or
+:class:`~django.db.models.Prefetch` objects with a custom queryset and/or ``to_attr``.
+
+Plans are inherited: the lookups of a model in the mapping also apply to its subclasses,
+and a subclass entry may specialize a plain lookup of a parent class with a ``Prefetch``
+object for the same path. Repeating a path with conflicting querysets raises
+:exc:`ValueError` immediately, before any query is executed.
+
+The prefetches are executed per result chunk (see
+:meth:`~django.db.models.query.QuerySet.iterator`), so the number of queries grows with the
+number of models and relations involved, not with the number of rows. Models that do not
+occur in the result cause no queries. The plan has no effect on querysets that are evaluated
+non-polymorphically (e.g. after :meth:`~polymorphic.managers.PolymorphicQuerySet.non_polymorphic`
+or :meth:`~django.db.models.query.QuerySet.values`).
+
+
 Using enhanced Q-objects in any Places
 --------------------------------------
 

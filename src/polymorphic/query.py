@@ -7,15 +7,15 @@ from __future__ import annotations
 import copy
 import heapq
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
-from django.db.models import FilteredRelation, Q
+from django.db.models import FilteredRelation, Prefetch, Q
 from django.db.models.expressions import Combinable
-from django.db.models.query import ModelIterable, QuerySet
+from django.db.models.query import ModelIterable, QuerySet, prefetch_related_objects
 from typing_extensions import Self, TypeVar
 
 from .query_translate import (
@@ -139,6 +139,94 @@ def transmogrify(cls: type[_All], obj: models.Model) -> _All:
         return new
 
 
+def _prefetch_entry_path(entry: "str | Prefetch") -> str:
+    """
+    Return the path under which a prefetch entry stores its results.
+
+    For :class:`~django.db.models.Prefetch` objects this is ``prefetch_to``,
+    which takes ``to_attr`` into account.
+    """
+    return entry if isinstance(entry, str) else entry.prefetch_to
+
+
+def _prefetch_entry_is_custom(entry: "str | Prefetch") -> bool:
+    """
+    Whether a prefetch entry carries a custom queryset or ``to_attr``.
+    """
+    return isinstance(entry, Prefetch) and (entry.queryset is not None or bool(entry.to_attr))
+
+
+def _merge_polymorphic_prefetch_entries(
+    model: type[models.Model], entries: Iterable["str | Prefetch"]
+) -> "tuple[str | Prefetch, ...]":
+    """
+    Merge the prefetch entries that apply to a single model class into a
+    deduplicated tuple, checking for conflicts.
+
+    The rules are:
+
+    * Plain lookups (strings, or ``Prefetch`` objects without a custom
+      queryset or ``to_attr``) that appear more than once for the same path
+      are deduplicated.
+    * A single customized ``Prefetch`` (with a queryset and/or ``to_attr``)
+      takes precedence over plain lookups for the same path. This allows a
+      subclass plan to specialize a plan inherited from a parent class.
+    * Multiple customized ``Prefetch`` objects for the same path are only
+      accepted if they are equivalent (same ``to_attr`` and the very same
+      queryset object). Anything else raises :exc:`ValueError`, as the
+      querysets conflict.
+    """
+    entries_per_path: dict[str, list[str | Prefetch]] = {}
+    for entry in entries:
+        entries_per_path.setdefault(_prefetch_entry_path(entry), []).append(entry)
+
+    merged: list[str | Prefetch] = []
+    for path, path_entries in entries_per_path.items():
+        custom = [entry for entry in path_entries if _prefetch_entry_is_custom(entry)]
+        if not custom:
+            # only plain lookups, deduplicate them
+            merged.append(path)
+            continue
+        first = custom[0]
+        assert isinstance(first, Prefetch)  # narrowed by _prefetch_entry_is_custom
+        for other in custom[1:]:
+            assert isinstance(other, Prefetch)
+            if other.to_attr != first.to_attr or other.queryset is not first.queryset:
+                raise ValueError(
+                    f"Conflicting prefetch querysets for path {path!r} in the "
+                    f"polymorphic prefetch plan of {model._meta.label}. "
+                    "Adjust the plan so that every path is prefetched with at "
+                    "most one custom queryset."
+                )
+        # a single custom Prefetch takes precedence over plain lookups
+        merged.append(first)
+    return tuple(merged)
+
+
+def _normalize_polymorphic_prefetch_lookups(
+    model: type[models.Model], lookups: "str | Prefetch | Iterable[str | Prefetch]"
+) -> "tuple[str | Prefetch, ...]":
+    """
+    Validate and normalize the lookups of a single polymorphic prefetch plan entry.
+    """
+    if isinstance(lookups, (str, Prefetch)):
+        lookups = (lookups,)
+    normalized: list[str | Prefetch] = []
+    for lookup in lookups:
+        if not isinstance(lookup, (str, Prefetch)):
+            raise TypeError(
+                f"Invalid lookup {lookup!r} in the polymorphic prefetch plan of "
+                f"{model._meta.label}. Lookups must be strings or Prefetch objects."
+            )
+        if isinstance(lookup, str) and not lookup:
+            raise ValueError(
+                f"Invalid empty lookup in the polymorphic prefetch plan of "
+                f"{model._meta.label}."
+            )
+        normalized.append(lookup)
+    return tuple(normalized)
+
+
 ###################################################################################
 # PolymorphicQuerySet
 
@@ -155,12 +243,21 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
 
     polymorphic_disabled: bool
     polymorphic_deferred_loading: tuple[set[str], bool]
+    polymorphic_prefetch_plan: dict[type[models.Model], "tuple[str | Prefetch, ...]"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._iterable_class = PolymorphicModelIterable
 
         self.polymorphic_disabled = False
+        # A mapping of model class -> prefetch lookups, applied to the real
+        # instances of exactly those classes (and their subclasses) after
+        # polymorphic retrieval. See polymorphic_prefetch().
+        self.polymorphic_prefetch_plan = {}
+        # Cache of model class -> effective prefetch lookups, resolved from
+        # polymorphic_prefetch_plan. Only valid for the current plan, it is
+        # reset whenever the plan changes.
+        self._polymorphic_prefetch_cache: dict[type[models.Model], tuple[str | Prefetch, ...]] = {}
         # A parallel structure to django.db.models.query.Query.deferred_loading,
         # which we maintain with the untranslated field names passed to
         # .defer() and .only() in order to be able to retranslate them when
@@ -176,6 +273,10 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
             copy.copy(self.polymorphic_deferred_loading[0]),
             self.polymorphic_deferred_loading[1],
         )
+        # The plan is treated as immutable (polymorphic_prefetch() replaces it
+        # on the clone), so it can be shared, together with its lookup cache.
+        new.polymorphic_prefetch_plan = self.polymorphic_prefetch_plan
+        new._polymorphic_prefetch_cache = self._polymorphic_prefetch_cache
         return new
 
     @classmethod
@@ -216,6 +317,123 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         if issubclass(qs._iterable_class, PolymorphicModelIterable):
             qs._iterable_class = ModelIterable
         return cast(PolymorphicQuerySet[_Base, _Base], qs)
+
+    def polymorphic_prefetch(
+        self,
+        plan: Mapping[
+            type[models.Model], "str | Prefetch | Iterable[str | Prefetch]"
+        ],
+    ) -> Self:
+        """
+        Prefetch relations per polymorphic subclass.
+
+        Takes a mapping of model class to prefetch lookups, for example::
+
+            Project.objects.polymorphic_prefetch({
+                ArtProject: ["artists"],
+                ResearchProject: [
+                    Prefetch("supervisors", queryset=Supervisor.objects.order_by("name")),
+                ],
+            })
+
+        After the real instances have been retrieved, the lookups of every
+        plan entry are applied to just the objects of that entry's model
+        (and its subclasses). This allows prefetching relations that only
+        exist on some subclasses, which :meth:`~django.db.models.query.QuerySet.prefetch_related`
+        cannot do from a base class queryset.
+
+        Lookups may be plain relation paths (including nested paths like
+        ``"tracks__label"``) or :class:`~django.db.models.Prefetch` objects
+        (with a custom queryset and/or ``to_attr``).
+
+        Plans are inherited: the lookups of a model in the mapping also apply
+        to its subclasses, with more derived classes being able to specialize
+        a plain lookup of a parent class with a ``Prefetch`` object for the
+        same path. Repeating the same path with conflicting querysets raises
+        :exc:`ValueError` immediately, before any query is executed.
+
+        The prefetches are executed per result chunk (see
+        :meth:`~django.db.models.query.QuerySet.iterator`), so the number of
+        queries grows with the number of models and relations involved, not
+        with the number of rows. Models that do not occur in the result cause
+        no queries.
+
+        The plan is only applied when real instances are retrieved, it has no
+        effect on querysets evaluated non-polymorphically (e.g. after
+        :meth:`non_polymorphic` or :meth:`~django.db.models.query.QuerySet.values`).
+
+        :param plan: A mapping of model class to a lookup or an iterable of lookups.
+        :return: A new queryset with the given plan merged into the current one.
+        """
+        if not isinstance(plan, Mapping):
+            raise TypeError(
+                "polymorphic_prefetch() expects a mapping of model class to "
+                f"prefetch lookups, got {plan!r}."
+            )
+        merged_plan: dict[type[models.Model], list[str | Prefetch]] = {
+            model: list(lookups) for model, lookups in self.polymorphic_prefetch_plan.items()
+        }
+        for model, lookups in plan.items():
+            if not isinstance(model, type) or not issubclass(model, self.model):
+                raise ValueError(
+                    f"Invalid model {model!r} in polymorphic prefetch plan. "
+                    f"Models must be subclasses of {self.model._meta.label}."
+                )
+            merged_plan.setdefault(model, []).extend(
+                _normalize_polymorphic_prefetch_lookups(model, lookups)
+            )
+
+        qs = self._clone()
+        qs.polymorphic_prefetch_plan = {
+            model: tuple(lookups) for model, lookups in merged_plan.items()
+        }
+        qs._polymorphic_prefetch_cache = {}
+        # Resolve the effective lookups of every model that may occur in the
+        # result up front, so that duplicate or conflicting querysets are
+        # reported now instead of mid-iteration.
+        qs._resolve_polymorphic_prefetch(self.model)
+        for real_class in concrete_descendants(self.model, include_proxy=True):
+            qs._resolve_polymorphic_prefetch(real_class)
+        return qs
+
+    def _resolve_polymorphic_prefetch(
+        self, real_class: type[models.Model]
+    ) -> "tuple[str | Prefetch, ...]":
+        """
+        Return the effective prefetch lookups for the given real class,
+        combining the plans of all its ancestors present in
+        ``polymorphic_prefetch_plan`` (base classes first). Results are cached.
+        """
+        try:
+            return self._polymorphic_prefetch_cache[real_class]
+        except KeyError:
+            pass
+        entries: list[str | Prefetch] = []
+        for ancestor in reversed(real_class.__mro__):
+            if ancestor in self.polymorphic_prefetch_plan:
+                entries.extend(self.polymorphic_prefetch_plan[ancestor])
+        lookups = _merge_polymorphic_prefetch_entries(real_class, entries)
+        self._polymorphic_prefetch_cache[real_class] = lookups
+        return lookups
+
+    def _execute_polymorphic_prefetch(self, objects: list[_All]) -> None:
+        """
+        Apply the polymorphic prefetch plan to a chunk of real instances.
+
+        Objects are grouped by their real class and each group's effective
+        lookups are prefetched with Django's own prefetch machinery, so the
+        number of queries scales with the number of models and relations in
+        the chunk, not with the number of objects.
+        """
+        if not objects:
+            return
+        objects_per_class: dict[type[models.Model], list[_All]] = {}
+        for obj in objects:
+            objects_per_class.setdefault(type(obj), []).append(obj)
+        for real_class, class_objects in objects_per_class.items():
+            lookups = self._resolve_polymorphic_prefetch(real_class)
+            if lookups:
+                prefetch_related_objects(class_objects, *lookups)
 
     @overload
     def instance_of(self, __a: type[_A], /) -> PolymorphicQuerySet[_A, _Base]: ...
@@ -636,6 +854,10 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
                 resultlist[result_idx] = real_object
 
         resultlist = [i for i in resultlist if i and i is not _Inconsistent]
+
+        # apply the per-class prefetch plans to the real instances
+        if self.polymorphic_prefetch_plan:
+            self._execute_polymorphic_prefetch(resultlist)
 
         # set polymorphic_annotate_names in all objects (currently just used for debugging/printing)
         if self.query.annotations:

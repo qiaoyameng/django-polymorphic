@@ -4,11 +4,12 @@ The manager class for use in the models.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import DEFAULT_DB_ALIAS, models, transaction
+from django.db.models import Prefetch
 from django.db.models.fields.related_descriptors import (
     ForwardManyToOneDescriptor,
     ForwardOneToOneDescriptor,
@@ -143,6 +144,17 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
 
     def not_instance_of(self, *args: type[PolymorphicModel]) -> PolymorphicQuerySet[_All, _Base]:
         return self.all().not_instance_of(*args)
+
+    def polymorphic_prefetch(
+        self,
+        plan: Mapping[type[models.Model], "str | Prefetch | Iterable[str | Prefetch]"],
+    ) -> PolymorphicQuerySet[_All, _Base]:
+        """
+        Prefetch relations per polymorphic subclass.
+
+        Proxies :meth:`polymorphic.query.PolymorphicQuerySet.polymorphic_prefetch`.
+        """
+        return self.all().polymorphic_prefetch(plan)
 
     def get_real_instances(self, base_result_objects: Iterable[_All] | None = None) -> list[_All]:
         return self.all().get_real_instances(base_result_objects=base_result_objects)
