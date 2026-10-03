@@ -1158,3 +1158,23 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+class BulkTimestampBase(PolymorphicModel):
+    """Base model for bulk_create_mixed() tests with timestamp fields."""
+
+    name = models.CharField(max_length=50)
+    created_at = models.DateTimeField(auto_now_add=True)
+    modified_at = models.DateTimeField(auto_now=True)
+
+
+class BulkTimestampChild(BulkTimestampBase):
+    """Intermediate multi-table level for bulk_create_mixed() tests."""
+
+    detail = models.CharField(max_length=50, default="")
+
+
+class BulkTimestampGrandChild(BulkTimestampChild):
+    """Deepest multi-table level for bulk_create_mixed() tests."""
+
+    extra = models.CharField(max_length=50, default="")

@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added ``PolymorphicQuerySet.bulk_create_mixed()`` /
+  ``PolymorphicManager.bulk_create_mixed()`` for bulk creating a batch of
+  different polymorphic subclasses that share a common base. It supports
+  multi-table inheritance (including several levels) and proxy types, inserts
+  parent tables before child tables with correct parent-link wiring, allows
+  mixed explicit and automatic primary keys, validates the batch before
+  writing, runs in a single transaction and returns objects in input order.
+  Raises ``polymorphic.models.PolymorphicBulkCreateError`` for invalid batches.
+
 v4.11.7 (2026-07-31)
 --------------------
 
@@ -1063,4 +1075,3 @@ Thanks to Ilya Semenov for the suggestion.
 .. toctree::
 
    drf
-

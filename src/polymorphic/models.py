@@ -31,6 +31,16 @@ class PolymorphicTypeUndefined(LookupError): ...
 class PolymorphicTypeInvalid(RuntimeError): ...
 
 
+class PolymorphicBulkCreateError(ValueError):
+    """
+    Raised by :meth:`~polymorphic.query.PolymorphicQuerySet.bulk_create_mixed`
+    when a batch cannot be created as a whole. This is a subclass of
+    :class:`ValueError`, matching the exceptions raised by Django's own
+    :meth:`~django.db.models.query.QuerySet.bulk_create` for unsupported usage.
+    """
+    ...
+
+
 class PolymorphicModel(models.Model, metaclass=PolymorphicModelBase):
     """
     Abstract base class that provides polymorphic behaviour

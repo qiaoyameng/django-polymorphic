@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
-from django.db import connections, models
+from django.db import connections, models, transaction
+from django.db.models import AutoField
 from django.db.models import FilteredRelation, Q
 from django.db.models.expressions import Combinable
 from django.db.models.query import ModelIterable, QuerySet
@@ -24,10 +25,10 @@ from .query_translate import (
     translate_polymorphic_filter_definitions_in_kwargs,
     translate_polymorphic_Q_object,
 )
-from .utils import concrete_descendants, route_to_ancestor
+from .utils import concrete_descendants, get_base_polymorphic_model, route_to_ancestor
 
 if TYPE_CHECKING:
-    from .models import PolymorphicModel  # noqa: F401
+    from .models import PolymorphicBulkCreateError, PolymorphicModel  # noqa: F401
 
 _All = TypeVar("_All", bound="PolymorphicModel", covariant=True)
 _Base = TypeVar("_Base", bound="PolymorphicModel", default="PolymorphicModel", covariant=True)
@@ -139,6 +140,141 @@ def transmogrify(cls: type[_All], obj: models.Model) -> _All:
         return new
 
 
+def _mixed_polymorphic_chain(
+    model: type["PolymorphicModel"],
+) -> list[type["PolymorphicModel"]]:
+    """
+    Return the concrete polymorphic models that ``model`` is stored across,
+    ordered from the root polymorphic table to the concrete model of ``model``
+    (a proxy model is folded into its concrete model).
+
+    Only single, linear multi-table inheritance chains and proxy models are
+    supported. Anything else raises :class:`PolymorphicBulkCreateError` before
+    any database write happens.
+    """
+    from .models import PolymorphicBulkCreateError, PolymorphicModel
+
+    concrete_model = model._meta.concrete_model
+
+    # A concrete model may have at most one concrete parent reached through a
+    # parent-link field. Several linked parents mean multiple (diamond or
+    # unrelated) inheritance and the correct insertion order is ambiguous.
+    def check_model(mdl: type[models.Model]) -> None:
+        linked_parents = [
+            parent for parent, link in mdl._meta.parents.items() if link is not None
+        ]
+        if len(linked_parents) > 1:
+            raise PolymorphicBulkCreateError(
+                f"bulk_create_mixed() does not support {mdl.__name__}: it has "
+                "multiple concrete parent tables "
+                f"({', '.join(p.__name__ for p in linked_parents)}). Only "
+                "single (linear) multi-table inheritance chains are supported."
+            )
+        for parent in linked_parents:
+            if not issubclass(parent, PolymorphicModel):
+                raise PolymorphicBulkCreateError(
+                    f"bulk_create_mixed() does not support {mdl.__name__}: its "
+                    f"concrete parent {parent.__name__} is not a "
+                    "PolymorphicModel."
+                )
+            check_model(parent)
+
+    check_model(concrete_model)
+
+    root = get_base_polymorphic_model(concrete_model)
+    assert root is not None, "Polymorphic model must have a polymorphic root"
+
+    chain = [
+        cls
+        for cls in reversed(concrete_model.__mro__)
+        if (
+            issubclass(cls, PolymorphicModel)
+            and not cls._meta.abstract
+            and not cls._meta.proxy
+            and cls is not PolymorphicModel
+            and issubclass(cls, root)
+        )
+    ]
+    return cast(list[type["PolymorphicModel"]], chain)
+
+
+def _row_pk_value(obj: models.Model, model: type[models.Model]) -> Any:
+    """
+    Return the primary key value that the row of ``model`` would use in the
+    inheritance chain of ``obj``, or ``None`` when it is unset.
+
+    Multi-table models that share the ancestor primary key do not store it
+    under their own (parent-link) ``pk.attname``; the value lives on an
+    ancestor field. For example ``Middle(pk=6)`` assigns the value to the
+    ``top_ptr_id`` link while the local ``pk.attname`` (also ``id``) stays
+    unset, yet the Top row must be created with ``id=6``. Walk the parent
+    links to find the field the value was actually assigned to.
+    """
+    attname = model._meta.pk.attname
+    if attname not in obj.__dict__:
+        return None
+    value = obj.__dict__[attname]
+    if value is not None:
+        return value
+    # The local pk field is unset: find the value on a parent link that points
+    # at this model's primary key (shared ancestor pk case).
+    for concrete in type(obj).__mro__:
+        opts = getattr(concrete, "_meta", None)
+        if opts is None:
+            continue
+        for parent, link in opts.parents.items():
+            if link is None:
+                continue
+            if parent is model or issubclass(parent, model):
+                link_value = obj.__dict__.get(link.attname)
+                if link_value is not None:
+                    return link_value
+    return None
+
+
+def _check_unsaved_relations(
+    obj: "PolymorphicModel", chain: list[type["PolymorphicModel"]]
+) -> None:
+    """
+    Mirror Django's unsaved-related-object protection (see
+    ``Model._prepare_related_fields_for_save``) for every table the object will
+    be written to, skipping parent links (wired automatically by this API) and
+    the internal polymorphic content type. GenericForeignKeys are checked too.
+    """
+    from .models import PolymorphicBulkCreateError
+
+    for model in chain:
+        for field in model._meta.concrete_fields:
+            if not field.is_relation or not field.is_cached(obj):
+                continue
+            if getattr(field.remote_field, "parent_link", False):
+                continue
+            related = getattr(obj, field.name, None)
+            if not related:
+                continue
+            if not related._is_pk_set():
+                raise PolymorphicBulkCreateError(
+                    "bulk_create_mixed() prohibited to prevent data loss due "
+                    f"to unsaved related object '{field.name}' on "
+                    f"{obj.__class__.__name__}. Save related objects first."
+                )
+            if getattr(obj, field.attname) in field.empty_values:
+                setattr(obj, field.name, related)
+        for field in model._meta.private_fields:
+            if (
+                field.is_relation
+                and field.is_cached(obj)
+                and hasattr(field, "fk_field")
+            ):
+                related = field.get_cached_value(obj, default=None)
+                if related and not related._is_pk_set():
+                    raise PolymorphicBulkCreateError(
+                        "bulk_create_mixed() prohibited to prevent data loss "
+                        f"due to unsaved related object '{field.name}' on "
+                        f"{obj.__class__.__name__}. Save related objects first."
+                    )
+
+
 ###################################################################################
 # PolymorphicQuerySet
 
@@ -206,6 +342,243 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         for obj in objs:
             obj.pre_save_polymorphic()
         return super().bulk_create(objs, batch_size, ignore_conflicts=ignore_conflicts)
+
+    def bulk_create_mixed(self, objs: Iterable[_All], batch_size: int | None = None) -> list[_All]:
+        """
+        Bulk create a batch of objects of different types that share a common
+        polymorphic base class, retaining the real (polymorphic) type of every
+        object.
+
+        Unlike :meth:`bulk_create` (which only supports a single concrete table
+        and therefore cannot be used with multi-table inherited models), this
+        method supports a *mixed* batch: proxy types and models that use
+        multi-table inheritance. Parent rows are inserted before child rows and
+        the generated primary keys are wired into the correct parent-link
+        fields. Objects may mix explicitly assigned primary keys with
+        automatically generated primary keys, and shared ancestor tables are
+        never written twice for the same object.
+
+        :param objs: New (unsaved) objects, all instances of a concrete model
+            in the same polymorphic inheritance chain as this queryset's model.
+        :param batch_size: Maximum number of rows per individual ``INSERT``
+            statement.
+        :return: The created objects in the same order as ``objs``.
+        :raises PolymorphicBulkCreateError: If validation fails. All checks
+            happen before any row is written, and a single transaction makes
+            sure a failure never leaves behind partially created objects.
+
+        .. note::
+
+            As with Django's :meth:`~django.db.models.query.QuerySet.bulk_create`,
+            ``save()`` is not called and ``pre_save``/``post_save`` signals are
+            not sent. Field-level ``pre_save`` hooks (such as ``auto_now`` and
+            ``auto_now_add``) *are* executed, and many-to-many relations are
+            not saved. Validations, custom ``save()`` logic and signal
+            receivers on the involved models do not run.
+        """
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("Batch size must be a positive integer.")
+
+        from .models import PolymorphicBulkCreateError
+
+        objs = list(objs)
+        if not objs:
+            return []
+
+        using = self.db
+        # Type-check against the queryset model (a proxy queryset such as
+        # RedheadDuck.objects must only accept RedheadDuck instances, while
+        # the concrete table used for writes is resolved per object).
+        queryset_model = self.model
+
+        # ------------------------------------------------------------------
+        # Validation phase: every error below is raised before any INSERT is
+        # issued so a rejected batch never touches the database.
+        # ------------------------------------------------------------------
+        plans: list[list[type[PolymorphicModel]]] = []
+        seen_instances: set[int] = set()
+        explicit_identities: set[tuple[type[PolymorphicModel], Any]] = set()
+
+        for obj in objs:
+            if not isinstance(obj, queryset_model):
+                raise PolymorphicBulkCreateError(
+                    f"bulk_create_mixed() only accepts instances of "
+                    f"{queryset_model.__name__} or its subclasses, got "
+                    f"{obj.__class__.__name__}."
+                )
+            if not obj._state.adding:
+                raise PolymorphicBulkCreateError(
+                    f"bulk_create_mixed() can only create new objects; "
+                    f"{obj.__class__.__name__} (pk={obj.pk!r}) already exists."
+                )
+            if id(obj) in seen_instances:
+                raise PolymorphicBulkCreateError(
+                    "bulk_create_mixed() received the same object instance "
+                    "twice; every object in the batch must be unique."
+                )
+            seen_instances.add(id(obj))
+
+            chain = _mixed_polymorphic_chain(obj.__class__)
+            _check_unsaved_relations(obj, chain)
+
+            for model in chain:
+                pk_value = _row_pk_value(obj, model)
+                if pk_value is not None:
+                    identity = (model, pk_value)
+                    if identity in explicit_identities:
+                        raise PolymorphicBulkCreateError(
+                            f"bulk_create_mixed() received multiple objects "
+                            f"that would create the same {model.__name__} row "
+                            f"with primary key {pk_value!r}."
+                        )
+                    # Add after the check: a single object legitimately shares
+                    # its root pk across the tables of its own chain, but a
+                    # later object must not target the same (table, pk).
+                    explicit_identities.add(identity)
+
+            plans.append(chain)
+
+        connection = connections[using]
+
+        # Resolve one ContentType per distinct real class through the target
+        # database alias (content type ids may differ across databases).
+        ctype_ids: dict[type[PolymorphicModel], int] = {}
+        ctype_manager = ContentType.objects.db_manager(using)
+        for obj in objs:
+            if obj.__class__ not in ctype_ids:
+                ctype_ids[obj.__class__] = ctype_manager.get_for_model(
+                    obj, for_concrete_model=False
+                ).pk
+
+        # ------------------------------------------------------------------
+        # Planning phase: build one row per (object, concrete table) and order
+        # the insert groups ancestor-first. The first-seen order of concrete
+        # chains is a valid topological order: a parent always appears before
+        # its children in every chain.
+        # ------------------------------------------------------------------
+        level_order: list[type[PolymorphicModel]] = []
+        for chain in plans:
+            for model in chain:
+                if model not in level_order:
+                    level_order.append(model)
+
+        # Each row keeps the position (index) of its source object so child
+        # rows can locate the already inserted parent row of the same object.
+        rows_by_level: dict[
+            type[PolymorphicModel], list[tuple[int, PolymorphicModel]]
+        ] = {model: [] for model in level_order}
+        for obj_index, (obj, chain) in enumerate(zip(objs, plans)):
+            for model in chain:
+                row = copy.copy(obj)
+                transmogrify(model, row)
+                # When the level shares the root primary key (the normal
+                # multi-table case, e.g. Middle(pk=200) stores 200 on the
+                # top_ptr_id link), mirror that value onto the root pk column
+                # so the parent row gets the requested value. Models with
+                # their own primary key (e.g. CustomPkInherit.pk -> custom_id)
+                # are left untouched.
+                if model._meta.pk is chain[0]._meta.pk:
+                    root_pk_value = _row_pk_value(obj, model)
+                    if root_pk_value is not None:
+                        setattr(row, chain[0]._meta.pk.attname, root_pk_value)
+                # polymorphic_ctype is a column on the root polymorphic table;
+                # the root row must record the *real* (leaf) type so that
+                # polymorphic reads can downcast the object.
+                if model is chain[0]:
+                    row.polymorphic_ctype_id = ctype_ids[obj.__class__]
+                rows_by_level[model].append((obj_index, row))
+
+        # ------------------------------------------------------------------
+        # Write phase: a single transaction ensures a failure anywhere rolls
+        # the whole batch back, so no object is ever left as a parent-only
+        # row.
+        # ------------------------------------------------------------------
+        # obj_index -> pk of the inserted row, per already flushed level;
+        # used to wire parent links before inserting child tables.
+        inserted_pks_by_level: dict[type[PolymorphicModel], dict[int, Any]] = {
+            model: {} for model in level_order
+        }
+
+        def flush_level(model: type[PolymorphicModel]) -> None:
+            indexed_rows = rows_by_level[model]
+            rows = [row for _, row in indexed_rows]
+            opts = model._meta
+            manager = cast(
+                Any,
+                model._base_manager.db_manager(using).non_polymorphic(),
+            )
+            manager._for_write = True
+            manager._prepare_for_bulk_create(rows)
+
+            # Wire this table's direct-parent links to the inserted parent rows.
+            for obj_index, row in indexed_rows:
+                for parent, link in model._meta.parents.items():
+                    if link is not None and parent in inserted_pks_by_level:
+                        setattr(
+                            row,
+                            link.attname,
+                            inserted_pks_by_level[parent][obj_index],
+                        )
+
+            with_pk = [row for row in rows if row._is_pk_set()]
+            without_pk = [row for row in rows if not row._is_pk_set()]
+
+            if without_pk and not connection.features.can_return_rows_from_bulk_insert:
+                raise PolymorphicBulkCreateError(
+                    "bulk_create_mixed() requires the database backend to be "
+                    "able to return primary keys from bulk inserts (needed to "
+                    "wire up parent-link fields), but the "
+                    f"{connection.vendor} backend cannot do this."
+                )
+
+            def insert_rows(
+                rows_to_insert: Sequence[PolymorphicModel], include_auto_pk: bool
+            ) -> None:
+                fields = [
+                    field
+                    for field in opts.local_concrete_fields
+                    if not field.generated
+                    and (include_auto_pk or not isinstance(field, AutoField))
+                ]
+                returned_columns = manager._batched_insert(
+                    list(rows_to_insert), fields, batch_size
+                )
+                for row, results in zip(rows_to_insert, returned_columns):
+                    for result, field in zip(results, opts.db_returning_fields):
+                        setattr(row, field.attname, result)
+
+            # Match Django's bulk_create() ordering: explicit-pk rows first.
+            insert_rows(with_pk, include_auto_pk=True)
+            insert_rows(without_pk, include_auto_pk=False)
+
+            for row in rows:
+                row._state.adding = False
+                row._state.db = using
+            inserted_pks_by_level[model] = {
+                obj_index: row.pk for obj_index, row in indexed_rows
+            }
+
+        with transaction.atomic(using=using, savepoint=False):
+            for model in level_order:
+                flush_level(model)
+
+            # Copy the persisted values (generated primary keys, parent-link
+            # pointers and every concrete field value) from each table's own
+            # row back onto the original object. Reading every level row
+            # (rather than just the leaf row) preserves values that live on an
+            # ancestor table, such as a shared root primary key.
+            for obj_index, obj in enumerate(objs):
+                chain = plans[obj_index]
+                for model in chain:
+                    level_row = dict(rows_by_level[model])[obj_index]
+                    for field in model._meta.local_concrete_fields:
+                        attname = field.attname
+                        if attname in level_row.__dict__:
+                            obj.__dict__[attname] = level_row.__dict__[attname]
+                obj._state.adding = False
+                obj._state.db = using
+
+        return objs
 
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         """switch off polymorphic behaviour for this query.

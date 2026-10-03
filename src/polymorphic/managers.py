@@ -147,6 +147,17 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def get_real_instances(self, base_result_objects: Iterable[_All] | None = None) -> list[_All]:
         return self.all().get_real_instances(base_result_objects=base_result_objects)
 
+    def bulk_create_mixed(self, objs: Iterable[_All], batch_size: int | None = None) -> list[_All]:
+        """
+        Bulk create objects of differing polymorphic types sharing this
+        manager's model as a common base.
+
+        See
+        :meth:`polymorphic.query.PolymorphicQuerySet.bulk_create_mixed` for
+        supported inheritance patterns, validation and transaction guarantees.
+        """
+        return self.all().bulk_create_mixed(objs, batch_size=batch_size)
+
     def create_from_super(self, obj: models.Model, **kwargs: Any) -> _Base:
         """
         Create an instance of this manager's model class from the given instance of a
