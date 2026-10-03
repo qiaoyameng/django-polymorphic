@@ -114,6 +114,15 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         return self.all().non_polymorphic()
 
+    def polymorphic_prefetch_related(
+        self,
+        plans: dict[type[PolymorphicModel], Any],
+        /,
+    ) -> PolymorphicQuerySet[_All, _Base]:
+        return cast(
+            PolymorphicQuerySet[_All, _Base], self.all().polymorphic_prefetch_related(plans)
+        )
+
     # fixme: remove overloads when/if typing ever supports variadic generic unions
     @overload
     def instance_of(self, __a: type[_A], /) -> PolymorphicQuerySet[_A, _Base]: ...

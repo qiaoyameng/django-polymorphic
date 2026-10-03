@@ -92,3 +92,70 @@ this performs an additional query via the :class:`~django.db.models.ForeignKey` 
 
 This uses the :meth:`~django.contrib.contenttypes.models.ContentTypeManager.get_for_id` function
 which caches the results internally.
+
+
+Per-model prefetch plans
+------------------------
+
+Relations frequently live on only one subclass of a polymorphic hierarchy. For
+example, an ``Article`` may have ``authors`` and a ``Video`` may have ``tracks``,
+while the common base class ``Media`` declares neither relation:
+
+.. code-block:: python
+
+    class Media(PolymorphicModel):
+        title = models.CharField(max_length=100)
+
+
+    class Article(Media):
+        authors = models.ManyToManyField(Author)
+
+
+    class Video(Media):
+        tracks = models.ManyToManyField(Track)
+
+A plain ``Media.objects.prefetch_related("authors")`` cannot work, because the
+result set is not homogeneous and ``authors`` does not exist on every object.
+Use
+:meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_prefetch_related` and
+pass a mapping of model class to prefetch plan. After the real subclass of each
+object is determined, every lookup is executed only against the objects whose
+real class is the key class or one of its subclasses:
+
+.. code-block:: python
+
+    Media.objects.order_by("id").polymorphic_prefetch_related(
+        {
+            Article: ["authors", Prefetch("lead_author", to_attr="lead")],
+            Video: Prefetch("tracks__album"),
+        }
+    )
+
+The value for each model may be a single lookup or a list of lookups. Lookups
+may be plain ``"relation__path"`` strings or
+:class:`~django.db.models.query.Prefetch` objects with a custom ``queryset``
+and/or ``to_attr``, including nested paths.
+
+Plan inheritance
+^^^^^^^^^^^^^^^^
+
+A plan registered on an ancestor applies to every concrete subclass below it.
+For a lookup that exists on the common base (for example ``media_tags``), one
+plan on the base class covers all result objects. Plans are collected starting
+from the most derived class and walking up the inheritance chain; the first
+declaration found for a resolved lookup wins, so a subclass can override an
+inherited plain lookup with a :class:`~django.db.models.query.Prefetch` object.
+Registering two different custom querysets for the same effective lookup (or a
+plain lookup together with a :class:`~django.db.models.query.Prefetch` object)
+raises ``ValueError`` before any prefetch query runs.
+
+Query count
+^^^^^^^^^^^
+
+Prefetching runs after the real instances are fetched, and therefore works
+with ``iterator()`` chunking as well as ``only()``/``defer()``, ``using()`` and
+``annotate()``. The number of additional queries per chunk grows with the
+number of distinct concrete model classes and relation kinds that actually
+occur in that chunk - never with the number of rows. Empty results, and
+subclasses that do not occur, emit no prefetch queries at all. Reading the
+prefetched attributes afterwards does not trigger any additional queries.

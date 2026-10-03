@@ -1158,3 +1158,55 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+class PrefetchMediaTag(models.Model):
+    name = models.CharField(max_length=50)
+
+
+class PrefetchMedia(PolymorphicModel):
+    """
+    Common polymorphic base for models carrying relations that differ between
+    subclasses. ``media_tags`` lives on the base and is therefore inherited by
+    every subclass; ``authors`` and ``tracks`` exist only on one subclass each.
+    """
+
+    title = models.CharField(max_length=100)
+    media_tags = models.ManyToManyField(PrefetchMediaTag, related_name="media")
+
+
+class PrefetchAuthor(models.Model):
+    name = models.CharField(max_length=100)
+
+
+class PrefetchTrack(models.Model):
+    title = models.CharField(max_length=100)
+    duration = models.IntegerField(default=0)
+    album = models.ForeignKey(
+        "PrefetchAlbum", related_name="tracks", on_delete=models.CASCADE, null=True
+    )
+
+
+class PrefetchAlbum(models.Model):
+    name = models.CharField(max_length=100)
+
+
+class PrefetchArticle(PrefetchMedia):
+    """A media item that has authors (a relation Video does not have)."""
+
+    authors = models.ManyToManyField(PrefetchAuthor, related_name="articles")
+    lead_author = models.ForeignKey(
+        PrefetchAuthor, related_name="lead_articles", on_delete=models.SET_NULL, null=True
+    )
+
+
+class PrefetchVideo(PrefetchMedia):
+    """A media item that has tracks (a relation Article does not have)."""
+
+    tracks = models.ManyToManyField(PrefetchTrack, related_name="videos")
+
+
+class PrefetchFeaturedArticle(PrefetchArticle):
+    """Second concrete level below PrefetchMedia, for testing plan inheritance."""
+
+    featured = models.BooleanField(default=False)
