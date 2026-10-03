@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import FieldDoesNotExist
-from django.db import connections, models
+from django.db import connections, models, transaction
+from django.db.utils import NotSupportedError
 from django.db.models import FilteredRelation, Q
 from django.db.models.expressions import Combinable
 from django.db.models.query import ModelIterable, QuerySet
+from django.utils.functional import partition
 from typing_extensions import Self, TypeVar
 
 from .query_translate import (
@@ -24,7 +26,12 @@ from .query_translate import (
     translate_polymorphic_filter_definitions_in_kwargs,
     translate_polymorphic_Q_object,
 )
-from .utils import concrete_descendants, route_to_ancestor
+from .utils import (
+    concrete_descendants,
+    inheritance_insert_layout,
+    route_to_ancestor,
+    sort_by_subclass,
+)
 
 if TYPE_CHECKING:
     from .models import PolymorphicModel  # noqa: F401
@@ -206,6 +213,206 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         for obj in objs:
             obj.pre_save_polymorphic()
         return super().bulk_create(objs, batch_size, ignore_conflicts=ignore_conflicts)
+
+    def bulk_create_polymorphic(
+        self,
+        objs: Iterable[_All],
+        batch_size: int | None = None,
+    ) -> list[_All]:
+        """
+        Insert each of the instances into the database, supporting a mixture of
+        different polymorphic types (multi-table inherited and proxy models) in
+        a single call.
+
+        Rows are written table by table, parents before children, so that
+        auto-generated primary keys are propagated to the parent link fields of
+        the child tables. Objects of sibling types share ancestor table rows
+        with their own primary key only - no parent row is inserted twice. The
+        whole batch runs in a single transaction: if any object fails, all
+        tables are rolled back and no orphaned parent rows remain.
+
+        The returned list contains the same objects, in the same order as the
+        input, with their primary keys set (provided the database supports
+        returning them, see ``can_return_rows_from_bulk_insert`` in the
+        :pypi:`Django` database features documentation).
+
+        Like :meth:`~django.db.models.query.QuerySet.bulk_create`, and unlike
+        :meth:`~django.db.models.Model.save`, this method:
+
+        * does not call ``save()`` on any of the objects,
+        * does not send any ``pre_save`` or ``post_save`` signals,
+        * does not set ``auto_now`` / ``auto_now_add`` field values,
+        * does not support ``ignore_conflicts`` / ``update_conflicts``.
+
+        All objects are validated before anything is written to the database.
+        A :exc:`TypeError` is raised for objects that are not an instance of
+        the queryset's model, and a :exc:`ValueError` is raised for duplicate
+        objects or primary keys, for unsaved related objects, and for
+        inheritance structures that are not supported (models with more than
+        one concrete parent).
+
+        :param objs: The objects to create. Every object must be an instance of
+            the queryset's model (i.e. of the common polymorphic base class or
+            one of its subclasses, including proxy models).
+        :param batch_size: The maximum number of rows to insert per query,
+            applied to each table separately.
+        """
+        from .models import PolymorphicModel
+
+        objs = list(objs)
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("Batch size must be a positive integer.")
+        if not objs:
+            return objs
+
+        using = self.db
+        base_model = self.model
+
+        layouts: dict[
+            type[models.Model], tuple[list[type[models.Model]], list[models.Field]]
+        ] = {}
+        seen_objects: set[int] = set()
+        seen_pks: set[tuple[type[models.Model], Any]] = set()
+
+        # Validation phase: check everything before writing any rows.
+        for obj in objs:
+            if not isinstance(obj, base_model):
+                obj_label = (
+                    obj._meta.label if isinstance(obj, models.Model) else obj.__class__.__name__
+                )
+                raise TypeError(
+                    f"bulk_create_polymorphic() requires instances of "
+                    f"{base_model._meta.label} or its subclasses, got {obj_label}."
+                )
+            if id(obj) in seen_objects:
+                raise ValueError(
+                    f"bulk_create_polymorphic() got the same {obj.__class__._meta.label} "
+                    "object more than once."
+                )
+            seen_objects.add(id(obj))
+
+            concrete_model = obj._meta.concrete_model
+            layout = layouts.get(concrete_model)
+            if layout is None:
+                # raises ValueError for unsupported inheritance structures
+                layout = inheritance_insert_layout(concrete_model)
+                layouts[concrete_model] = layout
+            tables, parent_links = layout
+            root_pk = tables[0]._meta.pk
+
+            # Normalize the primary key across the whole inheritance chain, so
+            # that explicit primary keys end up in every parent link and root
+            # primary key field, and primary keys with a field default (e.g.
+            # UUIDs) are generated up front.
+            pk_value = obj.pk
+            if pk_value is None:
+                pk_value = getattr(obj, root_pk.attname, None)
+            if pk_value is None and not isinstance(root_pk, models.AutoField):
+                pk_value = root_pk.get_pk_value_on_save(obj)
+            if pk_value is not None:
+                setattr(obj, root_pk.attname, pk_value)
+                for link in parent_links:
+                    setattr(obj, link.attname, pk_value)
+                identity = (tables[0], pk_value)
+                if identity in seen_pks:
+                    raise ValueError(
+                        f"bulk_create_polymorphic() got duplicate primary key "
+                        f"{pk_value!r} for {concrete_model._meta.label}."
+                    )
+                seen_pks.add(identity)
+
+            # Refuse unsaved related objects before any row is written. This
+            # checks all concrete fields of the object, including the fields
+            # inherited from every ancestor table.
+            obj._prepare_related_fields_for_save(operation_name="bulk_create_polymorphic")
+
+        if any(obj.pk is None for obj in objs) and not connections[
+            using
+        ].features.can_return_rows_from_bulk_insert:
+            raise NotSupportedError(
+                "bulk_create_polymorphic() with auto-generated primary keys "
+                "requires a database that can return them from a bulk insert."
+            )
+
+        # Assign the real content type of each object, fetched per database
+        # alias (get_for_model caches per alias, so this costs at most one
+        # query per distinct class).
+        content_types: dict[type[models.Model], int] = {}
+        ctype_manager = ContentType.objects.db_manager(using)
+        for obj in objs:
+            obj_class = obj.__class__
+            ctype_id = content_types.get(obj_class)
+            if ctype_id is None:
+                ctype_id = content_types[obj_class] = ctype_manager.get_for_model(
+                    obj_class, for_concrete_model=False
+                ).pk
+            obj.polymorphic_ctype_id = ctype_id
+
+        # Group the rows to insert per table. Sibling types share ancestor
+        # tables, but every object contributes exactly one row per table.
+        table_rows: dict[type[models.Model], list[PolymorphicModel]] = {}
+        for obj in objs:
+            tables, _ = layouts[obj._meta.concrete_model]
+            for table in tables:
+                table_rows.setdefault(table, []).append(obj)
+
+        with transaction.atomic(using=using):
+            # Ancestor tables come first, so primary keys generated by the
+            # root table insert can be propagated to the parent links below.
+            for table in sort_by_subclass(*table_rows):
+                rows = table_rows[table]
+                for obj in rows:
+                    tables, parent_links = layouts[obj._meta.concrete_model]
+                    if table is not tables[0]:
+                        pk_value = getattr(obj, tables[0]._meta.pk.attname)
+                        for link in parent_links:
+                            setattr(obj, link.attname, pk_value)
+                self._bulk_insert_table(table, rows, batch_size, using)
+
+        return objs
+
+    @staticmethod
+    def _bulk_insert_table(
+        table: type[models.Model],
+        objs: list[models.Model],
+        batch_size: int | None,
+        using: str,
+    ) -> None:
+        """
+        Insert the rows for a single table of an inheritance chain, writing
+        only the table's own columns and returning generated primary keys onto
+        the objects. Mirrors the mechanics of
+        :meth:`~django.db.models.query.QuerySet.bulk_create`, but scoped to the
+        local concrete fields of ``table``.
+        """
+        opts = table._meta
+        fields = [f for f in opts.local_concrete_fields if not f.generated]
+        queryset = models.QuerySet(model=table, using=using)
+        queryset._for_write = True
+
+        objs_without_pk, objs_with_pk = partition(lambda o: o._is_pk_set(), objs)
+        if objs_with_pk:
+            returned_columns = queryset._batched_insert(objs_with_pk, fields, batch_size)
+            for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                for result, field in zip(results, opts.db_returning_fields):
+                    if field != opts.pk:
+                        setattr(obj_with_pk, field.attname, result)
+            for obj_with_pk in objs_with_pk:
+                obj_with_pk._state.adding = False
+                obj_with_pk._state.db = using
+        if objs_without_pk:
+            fields_without_pk = [f for f in fields if not isinstance(f, models.AutoField)]
+            returned_columns = queryset._batched_insert(
+                objs_without_pk, fields_without_pk, batch_size
+            )
+            connection = connections[using]
+            if connection.features.can_return_rows_from_bulk_insert:
+                assert len(returned_columns) == len(objs_without_pk)
+            for obj_without_pk, results in zip(objs_without_pk, returned_columns):
+                for result, field in zip(results, opts.db_returning_fields):
+                    setattr(obj_without_pk, field.attname, result)
+                obj_without_pk._state.adding = False
+                obj_without_pk._state.db = using
 
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         """switch off polymorphic behaviour for this query.

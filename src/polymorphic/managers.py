@@ -114,6 +114,16 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         return self.all().non_polymorphic()
 
+    def bulk_create_polymorphic(
+        self, objs: Iterable[_All], batch_size: int | None = None
+    ) -> list[_All]:
+        """
+        Insert a mixture of different polymorphic types (multi-table inherited
+        and proxy models) in a single call. See
+        :meth:`polymorphic.query.PolymorphicQuerySet.bulk_create_polymorphic`.
+        """
+        return self.all().bulk_create_polymorphic(objs, batch_size=batch_size)
+
     # fixme: remove overloads when/if typing ever supports variadic generic unions
     @overload
     def instance_of(self, __a: type[_A], /) -> PolymorphicQuerySet[_A, _Base]: ...

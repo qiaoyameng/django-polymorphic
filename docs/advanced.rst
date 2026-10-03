@@ -348,6 +348,52 @@ delete the subclass instance while keeping the superclass instance. This can be 
 ensures that the ``polymorphic_ctype`` fields of the superclass instances are updated accordingly
 when doing this.
 
+Bulk Creation of Mixed Polymorphic Types
+----------------------------------------
+
+Django's :meth:`~django.db.models.query.QuerySet.bulk_create` does not support multi-table
+inheritance, so it cannot insert a batch of different polymorphic subtypes. Use
+:meth:`~polymorphic.managers.PolymorphicQuerySet.bulk_create_polymorphic` (also available on the
+manager) to create a mixture of multi-table inherited and proxy model instances in a single call:
+
+.. code-block:: python
+
+    >>> ModelA.objects.bulk_create_polymorphic([
+    ...     ModelC(field1='C1', field2='C2', field3='C3'),
+    ...     ModelA(field1='A1'),
+    ...     ModelB(field1='B1', field2='B2'),
+    ... ])
+    [ <ModelC: id 1, ...>, <ModelA: id 2, ...>, <ModelB: id 3, ...> ]
+
+Rows are written table by table, parents before children, and auto-generated primary keys are
+propagated to the parent link fields of the child tables. Objects of sibling types share their
+ancestor tables - every object gets exactly one row per table in its inheritance chain, and no
+parent row is inserted twice. Explicit and auto-generated primary keys may be mixed freely within
+one batch, and the returned objects are the same objects passed in, in the same order, with their
+primary keys set.
+
+The whole batch runs in a single transaction: if any object fails, all tables are rolled back, so
+no orphaned parent rows are left behind. All objects are validated before anything is written:
+objects of the wrong type, duplicate objects or primary keys, unsaved related objects, and
+unsupported inheritance structures (models with more than one concrete parent) are rejected up
+front.
+
+Like :meth:`~django.db.models.query.QuerySet.bulk_create`, and unlike
+:meth:`~django.db.models.Model.save`, this method:
+
+*   does not call ``save()`` on any of the objects,
+*   does not send any ``pre_save`` or ``post_save`` signals,
+*   does not set ``auto_now`` / ``auto_now_add`` field values,
+*   does not support ``ignore_conflicts`` / ``update_conflicts``.
+
+.. note::
+
+    Automatically generated primary keys require a database that can return them from a bulk
+    insert (see
+    :attr:`django.db.backends.base.features.BaseDatabaseFeatures.can_return_rows_from_bulk_insert`,
+    supported by SQLite, PostgreSQL and others). On databases without that capability, only
+    objects with explicitly set primary keys can be created this way.
+
 .. _restrictions:
 
 Restrictions & Caveats

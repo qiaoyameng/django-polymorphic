@@ -140,6 +140,46 @@ def route_to_ancestor(
     return found_route
 
 
+@lru_cache(maxsize=None)
+def inheritance_insert_layout(
+    model_class: type[models.Model],
+) -> tuple[list[type[models.Model]], list[models.Field[Any, Any]]]:
+    """
+    Compute the table insert layout for a concrete model in a single-parent
+    (multi-table) inheritance chain.
+
+    Returns a tuple ``(tables, parent_links)`` where ``tables`` is the list of
+    concrete models whose tables must receive a row when inserting an instance
+    of ``model_class``, ordered root-first, and ``parent_links`` is the list of
+    parent link fields in the same order (aligned with ``tables[1:]``).
+
+    Raises a :exc:`ValueError` for inheritance structures that are not
+    supported, i.e. models with more than one concrete parent.
+    """
+    tables: list[type[models.Model]] = []
+    links: list[models.Field[Any, Any]] = []
+
+    def visit(model: type[models.Model]) -> None:
+        concrete_parents = [
+            parent for parent, link in model._meta.parents.items() if link is not None
+        ]
+        if len(concrete_parents) > 1:
+            raise ValueError(
+                "Models with multiple concrete parents are not supported "
+                f"({model._meta.label} inherits from "
+                f"{', '.join(parent._meta.label for parent in concrete_parents)})."
+            )
+        for parent, link in model._meta.parents.items():
+            visit(parent)
+            if link is not None:
+                links.append(link)
+        if not model._meta.proxy:
+            tables.append(model)
+
+    visit(model_class)
+    return tables, links
+
+
 def is_model_loaded(model: type[models.Model]) -> bool:
     try:
         apps.get_model(model._meta.app_label, model._meta.model_name)
@@ -301,5 +341,6 @@ def _clear_utility_caches() -> None:
     """Clear all lru_cache caches in this module."""
     get_base_polymorphic_model.cache_clear()
     route_to_ancestor.cache_clear()
+    inheritance_insert_layout.cache_clear()
     concrete_descendants.cache_clear()
     _map_queryname_to_class.cache_clear()

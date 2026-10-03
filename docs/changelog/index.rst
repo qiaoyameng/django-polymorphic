@@ -1,6 +1,14 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added ``bulk_create_polymorphic()`` to ``PolymorphicQuerySet`` and ``PolymorphicManager``:
+  a bulk create API that accepts a mixture of multi-table inherited and proxy model instances,
+  inserting parent and child table rows in inheritance order within a single transaction.
+
+
 v4.11.7 (2026-07-31)
 --------------------
 
@@ -1063,4 +1071,3 @@ Thanks to Ilya Semenov for the suggestion.
 .. toctree::
 
    drf
-
