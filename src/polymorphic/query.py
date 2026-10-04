@@ -27,6 +27,7 @@ from .query_translate import (
 from .utils import concrete_descendants, route_to_ancestor
 
 if TYPE_CHECKING:
+    from .bulk_update import BulkUpdateReport  # noqa: F401
     from .models import PolymorphicModel  # noqa: F401
 
 _All = TypeVar("_All", bound="PolymorphicModel", covariant=True)
@@ -216,6 +217,34 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         if issubclass(qs._iterable_class, PolymorphicModelIterable):
             qs._iterable_class = ModelIterable
         return cast(PolymorphicQuerySet[_Base, _Base], qs)
+
+    def polymorphic_bulk_update(
+        self,
+        objects: Iterable[Any],
+        *,
+        batch_size: int | None = None,
+        strict: bool = False,
+    ) -> "BulkUpdateReport":
+        """
+        Bulk update a heterogeneous list of polymorphic objects, updating the
+        distinct concrete tables of the multi-table inheritance chain.
+
+        Each item may be an :class:`~polymorphic.bulk_update.ObjectUpdate` or a
+        ``(instance, {field: value})`` / ``(instance, [field, ...])`` tuple.
+        Only objects belonging to this queryset's polymorphic tree are accepted.
+
+        See :func:`polymorphic.bulk_update.polymorphic_bulk_update` for the full
+        description of field resolution, F-expression limits and error handling.
+        """
+        from .bulk_update import polymorphic_bulk_update
+
+        return polymorphic_bulk_update(
+            objects,
+            batch_size=batch_size,
+            strict=strict,
+            using=self.db,
+            queryset_model=self.model,
+        )
 
     @overload
     def instance_of(self, __a: type[_A], /) -> PolymorphicQuerySet[_A, _Base]: ...

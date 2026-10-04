@@ -11,6 +11,7 @@ API Documentation
 .. toctree::
 
    polymorphic.admin
+   polymorphic.bulk_update
    polymorphic.contrib/index
    polymorphic.formsets
    polymorphic.managers

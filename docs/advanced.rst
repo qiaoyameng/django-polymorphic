@@ -399,6 +399,54 @@ Restrictions & Caveats
     happens. In tests this happens when if :django-admin:`flush` is called by the teardown sequence
     in :class:`~django.test.TransactionTestCase`.
 
+Bulk updating mixed polymorphic objects
+---------------------------------------
+
+A single edit may contain several different leaf types, and each object only
+wants to change the fields it actually provides. Use
+:func:`~polymorphic.bulk_update.polymorphic_bulk_update` (or the queryset/manager
+method of the same name) with one entry per object::
+
+    from django.db.models import F
+    from polymorphic.bulk_update import ObjectUpdate
+
+    report = Project.objects.polymorphic_bulk_update([
+        ObjectUpdate(project, {"topic": "New topic"}),
+        ObjectUpdate(art_project, {
+            "topic": "Painting",
+            "ArtProject___artist": "V. van Gogh",
+        }),
+        ObjectUpdate(research_project, {
+            "ResearchProject___supervisor": "Dr. Winter",
+            "topic": F("topic"),
+        }),
+    ])
+
+Plain field names resolve against the concrete class of the object; the
+``ModelName___field`` (or ``app_label__ModelName___field``) syntax addresses a
+field of any ancestor table. Fields belonging to a sibling subclass are
+rejected, proxy models map to their concrete table, and the root primary key,
+parent-link pointers and ``polymorphic_ctype`` can never be modified.
+
+Values may be plain Python values or :class:`~django.db.models.F` expressions.
+An ``F`` expression may only reference a column on the *same* concrete table as
+the field it updates; spanning to an ancestor or sibling table raises an error,
+because such a join does not exist for a single-table ``UPDATE``.
+
+The same object (same root table and primary key) appearing more than once in
+the input is rejected rather than silently merged. Stale inputs (the stored
+content type no longer matches the object), deleted rows and per-table
+constraint failures are reported per object instead of being swallowed.
+
+All updates run in one database transaction, grouped by concrete table and
+split into batches:
+
+* By default a :class:`~polymorphic.bulk_update.BulkUpdateReport` with one
+  :class:`~polymorphic.bulk_update.ObjectUpdateResult` per input object is
+  returned; successful updates are committed even if other objects fail.
+* With ``strict=True`` any failure rolls back the entire batch and raises
+  :class:`~polymorphic.bulk_update.StrictBulkUpdateError`.
+
 .. old links:
     - http://code.djangoproject.com/wiki/ModelInheritance
     - http://lazypython.blogspot.com/2009/02/second-look-at-inheritance-and.html

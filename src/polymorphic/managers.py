@@ -114,6 +114,23 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def non_polymorphic(self) -> PolymorphicQuerySet[_Base, _Base]:
         return self.all().non_polymorphic()
 
+    def polymorphic_bulk_update(
+        self,
+        objects: Iterable[Any],
+        *,
+        batch_size: int | None = None,
+        strict: bool = False,
+    ) -> Any:
+        """
+        Bulk update a heterogeneous list of polymorphic objects, updating the
+        distinct concrete tables of the multi-table inheritance chain.
+
+        See :func:`polymorphic.bulk_update.polymorphic_bulk_update` for details.
+        """
+        return self.all().polymorphic_bulk_update(
+            objects, batch_size=batch_size, strict=strict
+        )
+
     # fixme: remove overloads when/if typing ever supports variadic generic unions
     @overload
     def instance_of(self, __a: type[_A], /) -> PolymorphicQuerySet[_A, _Base]: ...
