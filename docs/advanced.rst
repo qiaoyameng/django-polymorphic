@@ -265,9 +265,35 @@ About Queryset Methods
     ``real_objects=ModelA.objects.get_real_instances(base_objects_queryset_or_object_list)``
 
 *   :meth:`~django.db.models.query.QuerySet.values` &
-    :meth:`~django.db.models.query.QuerySet.values_list` currently do not return polymorphic
-    results. This may change in the future however. If you want to use these methods now, it's best
-    if you use ``Model.base_objects.values...`` as this is guaranteed to not change.
+    :meth:`~django.db.models.query.QuerySet.values_list` do not return polymorphic results. Use
+    ``Model.base_objects.values...`` if you only need the base table. When you want to project a
+    small set of common *and* subclass specific fields without constructing real model instances,
+    use the explicit polymorphic projection
+    :meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values`:
+
+    .. code-block:: python
+
+        from polymorphic.polyvalues import NOT_PRESENT
+
+        rows = ModelA.objects.polymorphic_values(
+            "id", "field1",                       # common base fields
+            "Model2B___field2",                  # positional subclass field
+            c3="Model2C___field3",               # aliased subclass field
+            upper=Upper("field1"),               # basic expressions
+        )
+        for row in rows:
+            # stable model identifier (proxy identity preserved)
+            row["polymorphic_ctype_id"]
+            # a subclass field that does not apply to the row ...
+            row["c3"] is NOT_PRESENT             # ... vs. exists but NULL:
+            row["c3"] is None
+            row["c3__present"]                   # explicit presence bit
+            row.is_present("c3")
+
+    Filtering, ordering and slicing/pagination are all executed in the database within a single
+    query - instances are never materialized. Fields from sibling subclasses may share an alias
+    (``(alias, "ModelX___field")`` tuples) when their types are compatible; incompatible types,
+    illegal paths and inherited field name conflicts raise ``FieldError`` early.
 
 *   :meth:`~django.db.models.query.QuerySet.defer` and :meth:`~django.db.models.query.QuerySet.only`
     work as expected. On Django 1.5+ they support the ``ModelX___field`` syntax, but on Django 1.4
@@ -358,7 +384,9 @@ Restrictions & Caveats
 
 *   Queryset methods :meth:`~django.db.models.query.QuerySet.values`,
     :meth:`~django.db.models.query.QuerySet.values_list`, and
-    :meth:`~django.db.models.query.QuerySet.select_related` are not yet fully supported (see above).
+    :meth:`~django.db.models.query.QuerySet.select_related` are not fully polymorphic (see above);
+    use :meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values` for a database-side
+    projection that includes subclass fields.
     :meth:`~django.db.models.query.QuerySet.extra` has one restriction: the resulting objects are
     required to have a unique primary key within the result set.
 

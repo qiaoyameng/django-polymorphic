@@ -147,6 +147,15 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def get_real_instances(self, base_result_objects: Iterable[_All] | None = None) -> list[_All]:
         return self.all().get_real_instances(base_result_objects=base_result_objects)
 
+    def polymorphic_values(
+        self, *fields: Any, **expressions: Any
+    ) -> PolymorphicQuerySet[dict[str, Any], _Base]:
+        """Proxy for :meth:`PolymorphicQuerySet.polymorphic_values`."""
+        return cast(
+            PolymorphicQuerySet[dict[str, Any], _Base],
+            self.all().polymorphic_values(*fields, **expressions),
+        )
+
     def create_from_super(self, obj: models.Model, **kwargs: Any) -> _Base:
         """
         Create an instance of this manager's model class from the given instance of a

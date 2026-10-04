@@ -18,6 +18,7 @@ from django.db.models.expressions import Combinable
 from django.db.models.query import ModelIterable, QuerySet
 from typing_extensions import Self, TypeVar
 
+from .polyvalues import build_polymorphic_values_queryset
 from .query_translate import (
     translate_polymorphic_field_path,
     translate_polymorphic_filter_definitions_in_args,
@@ -161,6 +162,9 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         self._iterable_class = PolymorphicModelIterable
 
         self.polymorphic_disabled = False
+        # Presence-bit metadata when this queryset is a polymorphic_values()
+        # projection (alias -> internal annotation name).
+        self._polymorphic_presence_map: dict[str, str] = {}
         # A parallel structure to django.db.models.query.Query.deferred_loading,
         # which we maintain with the untranslated field names passed to
         # .defer() and .only() in order to be able to retranslate them when
@@ -176,6 +180,7 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
             copy.copy(self.polymorphic_deferred_loading[0]),
             self.polymorphic_deferred_loading[1],
         )
+        new._polymorphic_presence_map = dict(self._polymorphic_presence_map)
         return new
 
     @classmethod
@@ -417,6 +422,31 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         clone = cast(Self, super()._values(*args, **kwargs))  # type: ignore[misc]
         clone.polymorphic_disabled = True
         return clone
+
+    def polymorphic_values(
+        self, *fields: Any, **expressions: Any
+    ) -> PolymorphicQuerySet[dict[str, Any], _Base]:
+        """
+        Return a lightweight polymorphic projection as dictionaries.
+
+        Like :meth:`~django.db.models.query.QuerySet.values`, but in addition
+        to common base-model fields it accepts subclass specific fields using
+        the ``ModelX___field`` syntax (and keyword aliases / basic
+        expressions). No real subclass instances are constructed.
+
+        Every row includes ``polymorphic_ctype_id`` (the stable model
+        identifier; proxy identity is retained). A subclass field that does
+        not apply to a row maps to
+        :data:`polymorphic.polyvalues.NOT_PRESENT`, a field that exists but is
+        ``NULL`` maps to ``None``, and an ``"<alias>__present"`` boolean is
+        added for every subclass specific alias. Filtering, ordering and
+        slicing/pagination are executed in the database within a single
+        query.
+        """
+        return cast(
+            PolymorphicQuerySet[dict[str, Any], _Base],
+            build_polymorphic_values_queryset(self, fields, expressions),
+        )
 
     # Since django_polymorphic 'V1.0 beta2', extra() always returns polymorphic results.
     # The resulting objects are required to have a unique primary key within the result set

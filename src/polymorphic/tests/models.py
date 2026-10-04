@@ -1158,3 +1158,33 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+class PolyValuesItem(PolymorphicModel):
+    """Base model for polymorphic_values() projection tests."""
+
+    name = models.CharField(max_length=30)
+    shared_number = models.IntegerField(null=True, blank=True)
+
+
+class PolyValuesAlpha(PolyValuesItem):
+    alpha_text = models.CharField(max_length=30, null=True, blank=True)
+    # Same field name as on the other siblings, but an incompatible type.
+    payload = models.CharField(max_length=30, null=True, blank=True)
+
+
+class PolyValuesBeta(PolyValuesItem):
+    beta_text = models.CharField(max_length=30, null=True, blank=True)
+    payload = models.IntegerField(null=True, blank=True)
+
+
+class PolyValuesGamma(PolyValuesItem):
+    gamma_text = models.CharField(max_length=30, null=True, blank=True)
+    payload = models.FloatField(null=True, blank=True)
+
+
+class PolyValuesAlphaProxy(PolyValuesAlpha):
+    """Proxy of a concrete child - ctype identity must be retained."""
+
+    class Meta:
+        proxy = True

@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added ``PolymorphicQuerySet.polymorphic_values()``: an explicit, database-side
+  polymorphic ``values()`` projection that selects common fields together with
+  ``Model___field`` subclass fields, returns a stable ``polymorphic_ctype_id``
+  per row (proxy identity preserved), and distinguishes fields that do not apply
+  to a row (``NOT_PRESENT`` / ``alias__present``) from columns that are ``NULL``.
+  Supports aliases, basic expressions, filtering, ordering and DB-side pagination
+  in a single query. Type conflicts, illegal paths and inherited field name clashes
+  raise ``FieldError`` early. The existing ``values()`` behavior is unchanged.
+
 v4.11.7 (2026-07-31)
 --------------------
 

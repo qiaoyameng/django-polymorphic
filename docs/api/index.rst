@@ -15,6 +15,7 @@ API Documentation
    polymorphic.formsets
    polymorphic.managers
    polymorphic.models
+   polymorphic.polyvalues
    polymorphic.deletion
    polymorphic.showfields
    polymorphic.templatetags/index
