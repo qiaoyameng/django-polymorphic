@@ -1158,3 +1158,52 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+# models for PolymorphicModel.retype() tests
+
+
+class DocumentBase(PolymorphicModel):
+    title = models.CharField(max_length=50)
+
+
+class DocumentText(DocumentBase):
+    body = models.CharField(max_length=50)
+
+
+class DocumentTextV2(DocumentText):
+    extra = models.CharField(max_length=50, blank=True, default="")
+
+
+class DocumentImage(DocumentBase):
+    image_url = models.CharField(max_length=50)
+
+
+class DocumentTextProxy(DocumentText):
+    class Meta:
+        proxy = True
+
+
+class DocumentNote(models.Model):
+    """Relation to the kept base table - must survive retyping."""
+
+    document = models.ForeignKey(DocumentBase, on_delete=models.CASCADE, related_name="notes")
+    text = models.CharField(max_length=50)
+
+
+class ProtectedDocumentRef(models.Model):
+    """Protected relation to a child table - must block retyping."""
+
+    text_doc = models.ForeignKey(
+        DocumentText, on_delete=models.PROTECT, related_name="protected_refs"
+    )
+    label = models.CharField(max_length=50)
+
+
+class NullableDocumentRef(models.Model):
+    """SET_NULL relation to a child table - reported as a retype warning."""
+
+    text_doc = models.ForeignKey(
+        DocumentText, on_delete=models.SET_NULL, null=True, related_name="nullable_refs"
+    )
+    label = models.CharField(max_length=50)

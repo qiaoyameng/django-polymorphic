@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Iterable
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import models, router, transaction
@@ -240,6 +240,54 @@ class PolymorphicModel(models.Model, metaclass=PolymorphicModelBase):
                 f"#{self.pk} does not have a corresponding model!"
             )
         return self.__class__.objects.db_manager(self._state.db).get(pk=self.pk)
+
+    def retype(
+        self,
+        target: type[models.Model],
+        *,
+        allowed,
+        fields: dict[str, Any] | None = None,
+        using: str | None = None,
+        dry_run: bool = False,
+    ):
+        """
+        Explicitly retype this object to another type in the same polymorphic
+        hierarchy, preserving the primary key and all fields stored on the
+        shared ancestor tables.
+
+        The deepest common concrete ancestor of the current and target type is
+        kept untouched; rows of the old type below that ancestor are removed
+        (without a cascading ``delete()``, so the base row is never deleted)
+        and rows for the target inheritance chain are inserted instead. The
+        ``polymorphic_ctype`` content type is switched in the same
+        transaction. On failure the original concrete type is restored.
+
+        Switching to or from a proxy model only changes the content type and
+        performs no table changes.
+
+        :param target: The target model class (may be a proxy model).
+        :param allowed: The explicit set of target types that are permitted;
+            ``target`` must be a member of it.
+        :param fields: Values for subclass specific fields of the target type
+            (and optionally updates for fields on kept ancestor rows).
+        :param using: The database alias to use.
+        :param dry_run: When True, only build and validate the plan and return
+            the :class:`~polymorphic.retype.RetypePlan` without changing the
+            database. Relations that cannot be preserved are reported on the
+            plan's ``blockers``/``warnings``.
+        :returns: With ``dry_run=True``, the :class:`~polymorphic.retype.RetypePlan`;
+            otherwise the re-fetched instance in its new real type. The old
+            Python instance is stale afterwards; its cached state has been
+            invalidated and it should be discarded.
+        """
+        from .retype import plan_retype
+
+        plan = plan_retype(self, target, allowed=allowed, fields=fields, using=using)
+        if dry_run:
+            return plan
+        return plan.execute()
+
+    retype.alters_data = True  # type: ignore[attr-defined]
 
     def delete(
         self, using: str | None = None, keep_parents: bool = False
