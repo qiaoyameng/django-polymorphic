@@ -179,6 +179,45 @@ with the ``polymorphic_ctype`` references, you may fix them using
     # Reset polymorphic_ctype for all models in the inheritance tree
     reset_polymorphic_ctype(Animal, Dog, Cat)
 
+Auditing damaged polymorphic data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Historical data can contain null ``polymorphic_ctype`` values, missing or stale
+:class:`~django.contrib.contenttypes.models.ContentType` rows, pointers to non-subclasses,
+a parent row whose declared leaf table is absent, or several incompatible leaf rows.
+Use :func:`~polymorphic.audit.audit_polymorphic_ctype` to scan a root table in primary-key
+batches. Each finding records the complete reachable inheritance-table evidence, the actual
+concrete leaves, broken parent pointers, proxy alternatives, and why an item cannot be
+repaired automatically.
+
+Automatic repair is proposed only when the current table rows identify exactly one concrete
+leaf and there is no proxy identity to infer. Multiple leaves, broken inheritance chains, and
+proxy choices remain manual decisions. The report never deletes business rows and never creates
+subclass fields.
+
+.. code-block:: python
+
+    from polymorphic.audit import (
+        apply_polymorphic_ctype_report,
+        audit_polymorphic_ctype,
+    )
+    from myapp.models import Animal
+
+    report = audit_polymorphic_ctype(Animal, batch_size=500)
+    result = apply_polymorphic_ctype_report(report)
+
+Each proposed update is performed inside its audit batch transaction and is conditioned on the
+original content-type pointer and the exact audited existence/absence of inheritance rows. If
+the data changed after the audit, that item is reported as stale and left unchanged.
+
+The same operation is available with the management command:
+
+.. code-block:: shell
+
+    python manage.py polymorphic_audit_ctype myapp.Animal
+    python manage.py polymorphic_audit_ctype myapp.Animal --dry-run
+    python manage.py polymorphic_audit_ctype myapp.Animal --apply
+
 Using Third Party Models (without modifying them)
 -------------------------------------------------
 

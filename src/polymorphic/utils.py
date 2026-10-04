@@ -41,9 +41,7 @@ def reset_polymorphic_ctype(*models: type[models.Model], **filters: Any) -> None
         models_list = list(reversed(models_list))
 
     for new_model in models_list:
-        new_ct = ContentType.objects.db_manager(using).get_for_model(
-            new_model, for_concrete_model=False
-        )
+        new_ct = _get_polymorphic_ctype(new_model, using=using)
 
         qs = new_model.objects.db_manager(using)  # type: ignore[attr-defined]
         if ignore_existing:
@@ -51,6 +49,14 @@ def reset_polymorphic_ctype(*models: type[models.Model], **filters: Any) -> None
         if filters:
             qs = qs.filter(**filters)
         qs.update(polymorphic_ctype=new_ct)
+
+
+def _get_polymorphic_ctype(
+    model: type[models.Model], using: str = DEFAULT_DB_ALIAS
+) -> ContentType:
+    return ContentType.objects.db_manager(using).get_for_model(
+        model, for_concrete_model=False
+    )
 
 
 def _compare_mro(cls1: type, cls2: type) -> int:

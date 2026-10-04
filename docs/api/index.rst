@@ -10,6 +10,7 @@ API Documentation
 
 .. toctree::
 
+   polymorphic.audit
    polymorphic.admin
    polymorphic.contrib/index
    polymorphic.formsets
