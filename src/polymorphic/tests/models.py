@@ -114,6 +114,18 @@ class ModelY(Base):
     field_y = models.CharField(max_length=30)
 
 
+class ModelXGuardian(models.Model):
+    """PROTECT relation to a polymorphic child table (used by retype tests)."""
+
+    x = models.ForeignKey(ModelX, on_delete=models.PROTECT, related_name="guardians")
+
+
+class ModelXAttachment(models.Model):
+    """CASCADE relation to a polymorphic child table (used by retype tests)."""
+
+    x = models.ForeignKey(ModelX, on_delete=models.CASCADE, related_name="attachments")
+
+
 class Enhance_Plain(models.Model):
     field_p = models.CharField(max_length=30)
 

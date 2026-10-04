@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Iterable
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import models, router, transaction
@@ -20,6 +20,9 @@ from .base import PolymorphicModelBase
 from .managers import PolymorphicManager
 from .query_translate import translate_polymorphic_Q_object
 from .utils import get_base_polymorphic_model, lazy_ctype
+
+if TYPE_CHECKING:
+    from .retype import RetypePlan
 
 ###################################################################################
 # PolymorphicModel
@@ -276,3 +279,71 @@ class PolymorphicModel(models.Model, metaclass=PolymorphicModelBase):
         return super().delete(using=using, keep_parents=keep_parents)
 
     delete.alters_data = True  # type: ignore[attr-defined]
+
+    def retype(
+        self,
+        target_model: type[Self],
+        *,
+        allowed_types: Iterable[type[Self]] | None = None,
+        field_values: dict[str, Any] | None = None,
+        dry_run: bool = False,
+        using: str | None = None,
+    ) -> "RetypePlan":
+        """
+        Explicitly change the concrete type of this instance to ``target_model``.
+
+        The base row (primary key) and all shared fields are preserved. The
+        common concrete ancestor of the current and target type is found, rows
+        for the target inheritance chain below that ancestor are created
+        (subclass specific fields must be supplied through ``field_values``)
+        and the old child rows that are no longer needed are removed without
+        cascading into the kept ancestor rows. The ``polymorphic_ctype``
+        switch and the table changes happen in a single transaction.
+
+        :param target_model: The model class to retype this instance to. It
+            must be part of the allowed set of types (see ``allowed_types``)
+            and belong to the same polymorphic tree. Proxy targets only switch
+            the content type and never touch any tables.
+        :param allowed_types: Explicit iterable of model classes this instance
+            may be retyped to. When omitted, the
+            ``polymorphic_retype_allowed_types`` class attribute is consulted;
+            if that is unset too, every concrete (and proxy) model in the
+            polymorphic tree is allowed.
+        :param field_values: Values for the subclass specific fields of the
+            target inheritance chain. Missing required fields or unknown
+            fields raise :class:`~polymorphic.retype.RetypeValidationError`
+            before anything is written.
+        :param dry_run: When True, only build and return the
+            :class:`~polymorphic.retype.RetypePlan` without executing it.
+        :param using: The database alias to use.
+        :return: The executed (or dry-run) :class:`~polymorphic.retype.RetypePlan`.
+            Use ``plan.get_instance()`` to fetch the instance as its new type.
+
+        Relations pointing at the removed child tables are inspected up front.
+        Relations that cannot be preserved (``PROTECT``/``RESTRICT``/
+        ``DO_NOTHING`` with existing objects) are reported through
+        :class:`~polymorphic.retype.RetypeProtectedError` before anything is
+        executed. On any failure the transaction is rolled back and the
+        original concrete type is restored. Cached state on this (now stale)
+        Python instance is explicitly invalidated after a successful retype.
+        """
+        from .retype import build_retype_plan, execute_retype
+
+        using = (
+            using
+            or self._state.db
+            or router.db_for_write(self.__class__, instance=self)
+            or DEFAULT_DB_ALIAS
+        )
+        plan = build_retype_plan(
+            self,
+            target_model,
+            allowed_types=allowed_types,
+            field_values=field_values,
+            using=using,
+        )
+        if dry_run:
+            return plan
+        return execute_retype(plan)
+
+    retype.alters_data = True  # type: ignore[attr-defined]

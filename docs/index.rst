@@ -123,6 +123,7 @@ Advanced topics
    migrating
    managers
    deletion
+   retype
    typing
    advanced
    changelog/index

@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added :meth:`~polymorphic.models.PolymorphicModel.retype` to explicitly change the
+  concrete type of an existing instance within its polymorphic tree. The base row and
+  shared fields are preserved, the target inheritance chain is created from
+  caller-supplied field values, obsolete child rows are removed without cascading into
+  the base rows and the content type switch happens in the same transaction. Supports
+  dry-run plans, allowed-type restrictions, proxy-only switches and reports relations
+  that block the conversion up front. See :doc:`/retype`.
+
 v4.11.7 (2026-07-31)
 --------------------
 
@@ -1063,4 +1074,3 @@ Thanks to Ilya Semenov for the suggestion.
 .. toctree::
 
    drf
-
