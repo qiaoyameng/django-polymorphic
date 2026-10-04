@@ -269,10 +269,68 @@ About Queryset Methods
     results. This may change in the future however. If you want to use these methods now, it's best
     if you use ``Model.base_objects.values...`` as this is guaranteed to not change.
 
+    For a projection that *is* polymorphic aware - without constructing any subclass instances -
+    use :meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values`. See
+    :ref:`polymorphic-values` below.
+
 *   :meth:`~django.db.models.query.QuerySet.defer` and :meth:`~django.db.models.query.QuerySet.only`
     work as expected. On Django 1.5+ they support the ``ModelX___field`` syntax, but on Django 1.4
     it is only possible to pass fields on the base model into these methods.
 
+
+.. _polymorphic-values:
+
+Polymorphic ``values()`` projections
+------------------------------------
+
+When an API only needs a few columns, constructing a real instance of every subclass is
+wasteful: a normal polymorphic query issues one extra query per concrete subclass.
+:meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values` returns plain
+dictionaries from a **single** SQL query that LEFT OUTER JOINs the subclass tables - no
+subclass instances, no downcast queries.
+
+Common columns are passed as ordinary field names. Columns living on subclass tables use
+the familiar ``Model___field`` syntax (``applabel__Model___field`` to disambiguate), or
+``(Model, "field")`` tuples, and can be given an alias as a keyword argument::
+
+    rows = Model2A.objects.polymorphic_values(
+        "field1",                                   # common field
+        "Model2C___field3",                         # subclass field, alias "field3"
+        b2="Model2B___field2",                        # explicit alias
+        loud=Upper(F("field1")),                    # base expression
+        shared=[                                    # one alias over several siblings
+            "Model2B___field2",
+            "Model2C___field3",
+        ],
+    )
+
+Every subclass column is returned together with an ``<alias>__present`` boolean. This
+distinguishes a field that does not belong to the row's concrete type
+(``present is False``, value ``None``) from a column that exists but is SQL ``NULL``
+(``present is True``, value ``None``). Each row also carries:
+
+* ``id`` - the stable primary key of the base row;
+* ``polymorphic_ctype_id`` - the (proxy-aware) content type id;
+* ``polymorphic_label`` - the ``app_label.model_name`` identity string.
+
+Proxy rows keep their proxy content type id while the concrete values come from their
+underlying table.
+
+``filter()`` (including ``Model___field`` lookups), ``order_by()`` and slicing all run in
+the database, so pagination is applied by SQL rather than slicing in Python::
+
+    Model2A.objects.polymorphic_values("field1").order_by("-id")[10:20]
+
+Arguments are validated eagerly, before anything is sent to the database. The following
+raise :class:`~django.core.exceptions.FieldError`: unknown models or fields, non-descendant
+models, proxy/abstract targets, inherited columns requested from the wrong table, parent
+pointer fields, related paths, duplicate aliases, the reserved ``__present`` suffix, and
+one alias combining subclass columns with incompatible field types. For sibling columns
+sharing a name *and* a type, pass them together as one multi-spec alias and they are
+returned via ``COALESCE``.
+
+The regular, non-polymorphic :meth:`~django.db.models.query.QuerySet.values` method keeps
+its existing behaviour; the two APIs coexist.
 
 Using enhanced Q-objects in any Places
 --------------------------------------
@@ -358,7 +416,10 @@ Restrictions & Caveats
 
 *   Queryset methods :meth:`~django.db.models.query.QuerySet.values`,
     :meth:`~django.db.models.query.QuerySet.values_list`, and
-    :meth:`~django.db.models.query.QuerySet.select_related` are not yet fully supported (see above).
+    :meth:`~django.db.models.query.QuerySet.select_related` are not yet fully supported (see
+    above). :meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values` offers a
+    single-query, identity-aware projection as an explicit alternative (see
+    :ref:`polymorphic-values`).
     :meth:`~django.db.models.query.QuerySet.extra` has one restriction: the resulting objects are
     required to have a unique primary key within the result set.
 

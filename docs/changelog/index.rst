@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Added :meth:`~polymorphic.query.PolymorphicQuerySet.polymorphic_values`, an explicit
+  polymorphic ``values()`` projection. It returns plain dictionaries (no subclass
+  instances, no extra downcast queries) with common fields, ``Model___field`` subclass
+  columns, aliases and base expressions. Every subclass column gets an ``<alias>__present``
+  boolean so a field that does not apply to a row can be distinguished from a column that
+  exists but is ``NULL``; rows also carry ``id``, a stable ``polymorphic_ctype_id`` /
+  ``polymorphic_label`` (proxy identity preserved). Filtering, ordering and pagination run
+  in the database, and invalid paths, inherited-field/alias conflicts and incompatible
+  alias types raise ``FieldError`` eagerly. The existing non-polymorphic ``values()``
+  behaviour is unchanged.
+
 v4.11.7 (2026-07-31)
 --------------------
 

@@ -1158,3 +1158,36 @@ class SaveKwargsModel(PolymorphicModel, SaveKwargsMixin):
     """PolymorphicModel.save() must forward extra kwargs down the MRO (issue #905)."""
 
     name = models.CharField(max_length=50)
+
+
+class ValuesProjectBase(PolymorphicModel):
+    """Base model for polymorphic_values() projection tests."""
+
+    name = models.CharField(max_length=50)
+
+
+class ValuesProjectAlpha(ValuesProjectBase):
+    """First sibling: a nullable text column."""
+
+    alpha_code = models.CharField(max_length=30, null=True)
+    shared_note = models.CharField(max_length=30, null=True)
+
+
+class ValuesProjectBeta(ValuesProjectBase):
+    """Second sibling: nullable numeric and nullable text columns."""
+
+    beta_amount = models.IntegerField(null=True)
+    shared_note = models.CharField(max_length=30, null=True)
+
+
+class ValuesProjectGamma(ValuesProjectBeta):
+    """Grandchild: a nullable boolean column."""
+
+    gamma_flag = models.BooleanField(null=True)
+
+
+class ValuesProjectAlphaProxy(ValuesProjectAlpha):
+    """Proxy child: identity must be preserved even though it has no table."""
+
+    class Meta:
+        proxy = True

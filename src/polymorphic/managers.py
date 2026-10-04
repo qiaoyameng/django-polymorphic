@@ -144,6 +144,14 @@ class PolymorphicManager(models.Manager[_All], Generic[_All, _Base]):
     def not_instance_of(self, *args: type[PolymorphicModel]) -> PolymorphicQuerySet[_All, _Base]:
         return self.all().not_instance_of(*args)
 
+    def polymorphic_values(self, *fields: Any, **expressions: Any) -> models.QuerySet:
+        """
+        Proxy for :meth:`PolymorphicQuerySet.polymorphic_values`: return a
+        lightweight polymorphic ``values()`` projection without constructing
+        subclass instances.
+        """
+        return self.all().polymorphic_values(*fields, **expressions)
+
     def get_real_instances(self, base_result_objects: Iterable[_All] | None = None) -> list[_All]:
         return self.all().get_real_instances(base_result_objects=base_result_objects)
 

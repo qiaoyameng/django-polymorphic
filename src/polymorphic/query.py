@@ -25,6 +25,12 @@ from .query_translate import (
     translate_polymorphic_Q_object,
 )
 from .utils import concrete_descendants, route_to_ancestor
+from .values import (
+    PolymorphicValuesIterable,
+    PolymorphicValuesProjection,
+    annotate_projection,
+    build_projection,
+)
 
 if TYPE_CHECKING:
     from .models import PolymorphicModel  # noqa: F401
@@ -167,6 +173,8 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         # retrieving the real instance (so that the deferred fields apply
         # to that queryset as well).
         self.polymorphic_deferred_loading = (set(), True)
+        # When set, this queryset is a polymorphic_values() projection.
+        self._polymorphic_values_projection: PolymorphicValuesProjection | None = None
 
     def _clone(self, *args: Any, **kwargs: Any) -> Self:
         # Django's _clone only copies its own variables, so we need to copy ours here
@@ -176,6 +184,7 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
             copy.copy(self.polymorphic_deferred_loading[0]),
             self.polymorphic_deferred_loading[1],
         )
+        new._polymorphic_values_projection = self._polymorphic_values_projection
         return new
 
     @classmethod
@@ -417,6 +426,85 @@ class PolymorphicQuerySet(QuerySet[_All], Generic[_All, _Base]):
         clone = cast(Self, super()._values(*args, **kwargs))  # type: ignore[misc]
         clone.polymorphic_disabled = True
         return clone
+
+    def _polymorphic_raw_annotate(self, **kwargs: Any) -> Self:
+        """Call Django's vanilla annotate without Model___field translation."""
+        return cast(Self, super().annotate(**kwargs))  # type: ignore[misc]
+
+    def polymorphic_values(self, *fields: Any, **expressions: Any) -> Self:
+        """
+        Project polymorphic rows into plain dictionaries without constructing
+        real subclass instances and without the extra per-subclass queries.
+
+        Common fields are given as plain names, subclass-specific columns use
+        the ``Model___field`` syntax (or ``(Model, "field")`` tuples) and may be
+        given an explicit alias as a keyword argument. Every such column is
+        accompanied by an ``<alias>__present`` boolean distinguishing rows of a
+        different type (``False``) from existing but ``NULL`` values
+        (``True`` / ``None``). Each row also receives ``id``,
+        ``polymorphic_ctype_id`` (proxy identity preserved) and
+        ``polymorphic_label`` (``app_label.model_name``).
+
+        Filtering, ordering and slicing/pagination are executed in the database;
+        everything is validated eagerly before any query is run.
+        """
+        projection = build_projection(self.model, fields, expressions)
+
+        # Translate Model___field F() paths inside user supplied expressions,
+        # then pull them out as ordinary annotations.
+        user_annotations: dict[str, Any] = {}
+        for alias, value in expressions.items():
+            from django.db.models.expressions import BaseExpression as _BE
+
+            if isinstance(value, _BE):
+                patched = copy.deepcopy(value)
+                self._process_aggregate_args((), {alias: patched})
+                user_annotations[alias] = patched
+
+        # Rebuild from the underlying model query so chaining polymorphic_values
+        # (or calling it on an already-projected queryset) never accumulates
+        # stale projection annotations. Filters, ordering, slicing and limits
+        # are retained by the clone.
+        clone = self._clone()
+        # Drop annotations/values-limiting state left by a previous projection so
+        # chaining polymorphic_values() rebuilds from scratch. User annotations
+        # unrelated to a projection are kept.
+        if self._polymorphic_values_projection is not None:
+            previous = self._polymorphic_values_projection
+            for annotation_name in (
+                tuple(previous.presence_annotations.values())
+                + tuple(previous.alias_models)
+                + ("_polymorphic_app_label", "_polymorphic_model")
+            ):
+                clone.query.annotations.pop(annotation_name, None)
+            # Undo the values()-limiting performed by the previous projection.
+            clone._fields = None
+            clone.query.set_values(())
+            clone.query.default_cols = True
+        clone._polymorphic_values_projection = None
+        clone._iterable_class = PolymorphicModelIterable
+        clone = annotate_projection(clone, projection)
+        if user_annotations:
+            clone = clone._polymorphic_raw_annotate(**user_annotations)
+
+        # Hidden annotations (presence bits, coalesced values, identity label
+        # parts) are selected by name; the iterable reshapes them into the
+        # user-visible projection described by projection.value_fields.
+        values_args = [
+            "id",
+            "polymorphic_ctype_id",
+            "_polymorphic_app_label",
+            "_polymorphic_model",
+            *projection.common_fields,
+            *projection.presence_annotations.values(),
+            *projection.alias_models.keys(),
+            *user_annotations.keys(),
+        ]
+
+        result = clone._values(*values_args)
+        result._polymorphic_values_projection = projection
+        result._iterable_class = PolymorphicValuesIterable
+        return result
 
     # Since django_polymorphic 'V1.0 beta2', extra() always returns polymorphic results.
     # The resulting objects are required to have a unique primary key within the result set
