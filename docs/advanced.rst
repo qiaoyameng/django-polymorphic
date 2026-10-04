@@ -179,6 +179,50 @@ with the ``polymorphic_ctype`` references, you may fix them using
     # Reset polymorphic_ctype for all models in the inheritance tree
     reset_polymorphic_ctype(Animal, Dog, Cat)
 
+Auditing and Repairing polymorphic_ctype
+----------------------------------------
+
+Historical data can contain ``polymorphic_ctype`` values that no longer match
+reality: NULL pointers, content types of deleted or unrelated models, pointers
+to leaf models whose table row is gone, or rows that exist in several
+incompatible leaf tables at once. While
+:func:`~polymorphic.utils.reset_polymorphic_ctype` blindly rewrites pointers
+per model, :func:`~polymorphic.audit.audit_polymorphic_ctype` first checks
+which tables of the inheritance tree actually contain each primary key and
+builds a reviewable repair plan:
+
+.. code-block:: python
+
+    from polymorphic.audit import audit_polymorphic_ctype
+
+    report = audit_polymorphic_ctype(Animal, batch_size=1000)
+    report.summary()   # counts per finding category
+    report.fix_plan()  # the proposed pointer changes, with evidence
+
+    for item in report.items:
+        print(item.pk, item.category, item.reason)
+
+Every finding is classified (see
+:class:`~polymorphic.audit.AuditCategory`): a missing pointer, a pointer to a
+model outside the inheritance tree (including deleted content types), a
+pointer to a leaf whose table row is missing, several incompatible leaf rows
+for the same primary key, or a concrete type whose proxy identity cannot be
+inferred from the table structure. An automatic fix is only proposed when the
+table structure uniquely determines the type - the deepest existing model is
+never picked blindly, and ambiguous cases such as proxy identities are
+reported for manual decision instead.
+
+Applying the report re-verifies every finding inside per-batch transactions:
+the stored pointer and the table existence relations must be unchanged since
+the audit, otherwise the finding is rejected and left untouched. No business
+rows are ever deleted and no subclass rows are created - only the
+``polymorphic_ctype`` pointer on the base table is rewritten:
+
+.. code-block:: python
+
+    result = report.apply(batch_size=500)
+    result.summary()  # fixed / rejected / manual counts, per-batch statistics
+
 Using Third Party Models (without modifying them)
 -------------------------------------------------
 

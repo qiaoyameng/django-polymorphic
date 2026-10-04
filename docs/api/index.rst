@@ -19,3 +19,4 @@ API Documentation
    polymorphic.showfields
    polymorphic.templatetags/index
    polymorphic.utils
+   polymorphic.audit
